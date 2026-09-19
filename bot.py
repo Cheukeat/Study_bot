@@ -1,6 +1,8 @@
 import os
 import asyncio
 import datetime
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
 from telegram.ext import (
@@ -18,7 +20,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 DB_PATH = "study_room.db"
 
 if not BOT_TOKEN:
-    raise ValueError("Error: BOT_TOKEN not found. Make sure it is defined in your .env file.")
+    raise ValueError("BOT_TOKEN environment variable not set. Add it in Render's Environment settings.")
 
 # In-memory Redis simulation
 r = FakeAsyncRedis(decode_responses=True)
@@ -48,6 +50,23 @@ OPEN_PERMISSIONS = ChatPermissions(
     can_add_web_page_previews=True,
 )
 
+# --- Minimal HTTP Server for Render Free Tier ---
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Study Room Bot is running!")
+
+    def log_message(self, format, *args):
+        # Silence default HTTP access logs in terminal
+        return
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
+
 # --- Database Initialization ---
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -68,11 +87,13 @@ async def start_study(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user
 
+    # Prevent concurrent sessions in the same group
     is_active = await r.get(f"active_session:{chat_id}")
     if is_active:
         await update.message.reply_text("⚠️ A study session is already active in this room!")
         return
 
+    # Parse duration (default: 25 mins)
     duration = 25
     if context.args:
         try:
@@ -83,11 +104,13 @@ async def start_study(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             pass
 
+    # Restrict media & stickers in the group
     try:
         await context.bot.set_chat_permissions(chat_id=chat_id, permissions=STUDY_PERMISSIONS)
     except Exception as e:
         print(f"[Warn] Could not set chat permissions: {e}")
 
+    # Initialize state in Redis
     await r.set(f"active_session:{chat_id}", duration, ex=(duration + 10) * 60)
     await r.sadd(f"members:{chat_id}", f"{user.id}:{user.first_name}")
 
@@ -104,6 +127,7 @@ async def start_study(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
+    # Schedule completion job
     context.job_queue.run_once(
         finish_session,
         when=duration * 60,
@@ -148,6 +172,7 @@ async def finish_session(context: ContextTypes.DEFAULT_TYPE):
     today = datetime.date.today().isoformat()
     mentions = []
 
+    # Record completed minutes & streaks in SQLite
     async with aiosqlite.connect(DB_PATH) as db:
         for member in members:
             user_id, name = member.split(":", 1)
@@ -174,9 +199,11 @@ async def finish_session(context: ContextTypes.DEFAULT_TYPE):
                 )
         await db.commit()
 
+    # Clear active Redis state
     await r.delete(f"active_session:{chat_id}")
     await r.delete(f"members:{chat_id}")
 
+    # Unlock chat permissions
     try:
         await context.bot.set_chat_permissions(chat_id=chat_id, permissions=OPEN_PERMISSIONS)
     except Exception as e:
@@ -230,6 +257,10 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     asyncio.run(init_db())
 
+    # Start the dummy HTTP server in a separate thread so Render's health check passes
+    server_thread = threading.Thread(target=run_health_server, daemon=True)
+    server_thread.start()
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("study", start_study))
@@ -240,4 +271,4 @@ def main():
     app.run_polling()
 
 if __name__ == "__main__":
-    main()~
+    main()
