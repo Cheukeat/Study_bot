@@ -22,10 +22,8 @@ DB_PATH = "study_room.db"
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable not set. Add it in your .env file or Render settings.")
 
-# In-memory Redis simulation
 r = FakeAsyncRedis(decode_responses=True)
 
-# Permission Profiles
 STUDY_PERMISSIONS = ChatPermissions(
     can_send_messages=True,
     can_send_other_messages=False,
@@ -66,7 +64,7 @@ def run_health_server():
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
     server.serve_forever()
 
-# --- Database Initialization ---
+# --- Database Initialization & Helpers ---
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -80,10 +78,7 @@ async def init_db():
         """)
         await db.commit()
 
-# --- Core SQLite Helpers ---
-
 async def db_get_user_stats(user_id: int):
-    """Core pattern: Read user record using parameterized query."""
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             "SELECT username, total_minutes, current_streak, last_study_date FROM users WHERE user_id = ?",
@@ -92,7 +87,6 @@ async def db_get_user_stats(user_id: int):
         return await cursor.fetchone()
 
 async def db_record_session(user_id: int, username: str, duration: int):
-    """Core pattern: Read, calculate streak, and write (INSERT/UPDATE + commit)."""
     today = datetime.date.today().isoformat()
     yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
 
@@ -122,37 +116,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     welcome_text = (
         f"👋 Hello, **{user.first_name}**!\n\n"
-        f"Welcome to the **Study Room Assistant**.\n"
-        f"I help groups run synchronized Pomodoro sprints and stay productive.\n\n"
-        f"**Available Commands:**\n"
+        f"Welcome to the **Study Room Assistant**.\n\n"
+        f"**Commands:**\n"
         f"• `/study [minutes]` - Start a timed sprint (e.g. `/study 25`)\n"
-        f"• `/stats` - View your personal completed hours and streak\n"
-        f"• `/leaderboard` - Show the top room participants\n\n"
-        f"Add me to your study group and make me an **Admin** to enable media lock mode during sprints!"
+        f"• `/cancel` - Stop the active sprint early\n"
+        f"• `/stats` - View your personal completed focus time & streak\n"
+        f"• `/leaderboard` - View the room leaderboard\n"
+        f"• `/help` - Show usage instructions"
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
-async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    row = await db_get_user_stats(user.id)
-
-    if not row:
-        await update.message.reply_text(
-            f"You haven't logged any study sessions yet, {user.first_name}! Use `/study 25` to begin.",
-            parse_mode="Markdown"
-        )
-        return
-
-    name, minutes, streak, last_date = row
-    hours = round(minutes / 60, 1)
-
-    stats_text = (
-        f"📊 **Personal Focus Stats: {name}**\n\n"
-        f"• **Total Study Time:** {hours} hrs ({minutes} mins)\n"
-        f"• **Current Streak:** 🔥 {streak} day{'s' if streak > 1 else ''}\n"
-        f"• **Last Active Session:** {last_date or 'Today'}"
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        f"📖 **Study Room Bot Guide**\n\n"
+        f"1. Add the bot to your study group.\n"
+        f"2. Promote the bot to **Admin** with permission to *Change Chat Info* and *Restrict Members*.\n"
+        f"3. Run `/study 25` to begin a sprint.\n"
+        f"4. Other participants click **Join Session** to log their focus time.\n"
+        f"5. If you need to stop early, run `/cancel`."
     )
-    await update.message.reply_text(stats_text, parse_mode="Markdown")
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 async def start_study(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -160,7 +143,7 @@ async def start_study(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     is_active = await r.get(f"active_session:{chat_id}")
     if is_active:
-        await update.message.reply_text("⚠️ A study session is already active in this room!")
+        await update.message.reply_text("⚠️ A study session is already active in this room! Use `/cancel` to stop it.")
         return
 
     duration = 25
@@ -201,6 +184,47 @@ async def start_study(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name=f"study_{chat_id}"
     )
 
+async def cancel_study(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+
+    # In groups, check if the sender is an admin or host
+    if update.effective_chat.type in ["group", "supergroup"]:
+        member = await context.bot.get_chat_member(chat_id, user.id)
+        if member.status not in ["creator", "administrator"]:
+            await update.message.reply_text("⚠️ Only group administrators can cancel an active study sprint.")
+            return
+
+    is_active = await r.get(f"active_session:{chat_id}")
+    if not is_active:
+        await update.message.reply_text("There is no active study session to cancel.")
+        return
+
+    # Cancel scheduled jobs (both focus timer and break timer if active)
+    current_jobs = context.job_queue.get_jobs_by_name(f"study_{chat_id}")
+    for job in current_jobs:
+        job.schedule_removal()
+
+    break_jobs = context.job_queue.get_jobs_by_name(f"break_{chat_id}")
+    for job in break_jobs:
+        job.schedule_removal()
+
+    # Clear state from Redis
+    await r.delete(f"active_session:{chat_id}")
+    await r.delete(f"members:{chat_id}")
+
+    # Restore group chat permissions
+    try:
+        await context.bot.set_chat_permissions(chat_id=chat_id, permissions=OPEN_PERMISSIONS)
+    except Exception as e:
+        print(f"[Warn] Could not restore chat permissions: {e}")
+
+    await update.message.reply_text(
+        f"🛑 **Session Cancelled by {user.first_name}.**\n\n"
+        f"Chat permissions have been unlocked. No minutes were logged for this session.",
+        parse_mode="Markdown"
+    )
+
 async def join_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -210,7 +234,7 @@ async def join_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     is_active = await r.get(f"active_session:{chat_id}")
     if not is_active:
-        await query.edit_message_text("This session has already ended.")
+        await query.edit_message_text("This session has already ended or was cancelled.")
         return
 
     await r.sadd(f"members:{chat_id}", f"{user.id}:{user.first_name}")
@@ -277,6 +301,28 @@ async def finish_break(context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
+async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    row = await db_get_user_stats(user.id)
+
+    if not row:
+        await update.message.reply_text(
+            f"You haven't logged any study sessions yet, {user.first_name}! Use `/study 25` to begin.",
+            parse_mode="Markdown"
+        )
+        return
+
+    name, minutes, streak, last_date = row
+    hours = round(minutes / 60, 1)
+
+    stats_text = (
+        f"📊 **Personal Focus Stats: {name}**\n\n"
+        f"• **Total Study Time:** {hours} hrs ({minutes} mins)\n"
+        f"• **Current Streak:** 🔥 {streak} day{'s' if streak > 1 else ''}\n"
+        f"• **Last Active Session:** {last_date or 'Today'}"
+    )
+    await update.message.reply_text(stats_text, parse_mode="Markdown")
+
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
@@ -305,8 +351,10 @@ def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("stats", my_stats))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("study", start_study))
+    app.add_handler(CommandHandler("cancel", cancel_study))
+    app.add_handler(CommandHandler("stats", my_stats))
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CallbackQueryHandler(join_session, pattern=r"^join_"))
 
