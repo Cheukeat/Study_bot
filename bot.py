@@ -20,33 +20,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 DB_PATH = "study_room.db"
 
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN environment variable not set. Add it in your .env file or Render settings.")
+    raise ValueError("BOT_TOKEN environment variable not set.")
 
 r = FakeAsyncRedis(decode_responses=True)
-
-STUDY_PERMISSIONS = ChatPermissions(
-    can_send_messages=True,
-    can_send_other_messages=False,
-    can_send_photos=False,
-    can_send_videos=False,
-    can_send_documents=False,
-    can_send_audios=False,
-    can_send_video_notes=False,
-    can_send_voice_notes=False,
-    can_add_web_page_previews=False,
-)
-
-OPEN_PERMISSIONS = ChatPermissions(
-    can_send_messages=True,
-    can_send_other_messages=True,
-    can_send_photos=True,
-    can_send_videos=True,
-    can_send_documents=True,
-    can_send_audios=True,
-    can_send_video_notes=True,
-    can_send_voice_notes=True,
-    can_add_web_page_previews=True,
-)
 
 # --- Minimal HTTP Server for Render Health Checks ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -64,7 +40,7 @@ def run_health_server():
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
     server.serve_forever()
 
-# --- Database Initialization & Helpers ---
+# --- Database Initialization ---
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -78,270 +54,107 @@ async def init_db():
         """)
         await db.commit()
 
-async def db_get_user_stats(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT username, total_minutes, current_streak, last_study_date FROM users WHERE user_id = ?",
-            (user_id,)
-        )
-        return await cursor.fetchone()
-
-async def db_record_session(user_id: int, username: str, duration: int):
-    today = datetime.date.today().isoformat()
-    yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT current_streak, last_study_date FROM users WHERE user_id = ?", (user_id,))
-        row = await cursor.fetchone()
-
-        if not row:
-            await db.execute(
-                "INSERT INTO users (user_id, username, total_minutes, current_streak, last_study_date) VALUES (?, ?, ?, ?, ?)",
-                (user_id, username, duration, 1, today)
-            )
-        else:
-            streak, last_date = row
-            if last_date != today:
-                streak = streak + 1 if last_date == yesterday else 1
-
-            await db.execute(
-                "UPDATE users SET total_minutes = total_minutes + ?, current_streak = ?, last_study_date = ?, username = ? WHERE user_id = ?",
-                (duration, streak, today, username, user_id)
-            )
-        await db.commit()
-
-# --- Bot Command Handlers ---
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    welcome_text = (
-        f"👋 Hello, **{user.first_name}**!\n\n"
-        f"Welcome to the **Study Room Assistant**.\n\n"
-        f"**Commands:**\n"
-        f"• `/study [minutes]` - Start a timed sprint (e.g. `/study 25`)\n"
-        f"• `/cancel` - Stop the active sprint early\n"
-        f"• `/stats` - View your personal completed focus time & streak\n"
-        f"• `/leaderboard` - View the room leaderboard\n"
-        f"• `/help` - Show usage instructions"
-    )
-    await update.message.reply_text(welcome_text, parse_mode="Markdown")
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- Helper: Render Dashboard Card ---
+def build_dashboard(subject: str, minutes_left: int, state: str = "Focus session"):
     text = (
-        f"📖 **Study Room Bot Guide**\n\n"
-        f"1. Add the bot to your study group.\n"
-        f"2. Promote the bot to **Admin** with permission to *Change Chat Info* and *Restrict Members*.\n"
-        f"3. Run `/study 25` to begin a sprint.\n"
-        f"4. Other participants click **Join Session** to log their focus time.\n"
-        f"5. If you need to stop early, run `/cancel`."
+        f"┌────────────────────────┐\n"
+        f"│ **STUDY ROOM ASSISTANT**\n"
+        f"│ **{subject}**\n"
+        f"│\n"
+        f"│       ⏳ **{minutes_left:02d}:00**\n"
+        f"│     _{state}_\n"
+        f"└────────────────────────┘\n\n"
+        f"📅 **Quick Schedule**\n"
+        f"• `08:00–10:00` — Self-study\n"
+        f"• `14:00–16:00` — Outside class\n"
+        f"• `Evening`     — Review\n"
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    return text
 
-async def start_study(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def build_keyboard(chat_id: int, is_paused: bool = False):
+    play_pause_btn = (
+        InlineKeyboardButton("▶️ Resume", callback_data=f"resume_{chat_id}")
+        if is_paused
+        else InlineKeyboardButton("⏸ Pause", callback_data=f"pause_{chat_id}")
+    )
+    keyboard = [
+        [
+            InlineKeyboardButton("▶️ Start", callback_data=f"start_{chat_id}"),
+            play_pause_btn,
+            InlineKeyboardButton("🔄 Reset", callback_data=f"reset_{chat_id}"),
+        ],
+        [
+            InlineKeyboardButton("⏱ 25m", callback_data=f"set_25_{chat_id}"),
+            InlineKeyboardButton("⏱ 50m", callback_data=f"set_50_{chat_id}"),
+            InlineKeyboardButton("✋ Join", callback_data=f"join_{chat_id}"),
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+# --- Handlers ---
+async def panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    user = update.effective_user
-
-    is_active = await r.get(f"active_session:{chat_id}")
-    if is_active:
-        await update.message.reply_text("⚠️ A study session is already active in this room! Use `/cancel` to stop it.")
-        return
-
+    
+    # Defaults
+    subject = "Mathematics"
     duration = 25
     if context.args:
-        try:
-            duration = int(context.args[0])
-            if duration < 1 or duration > 120:
-                await update.message.reply_text("Please choose a duration between 1 and 120 minutes.")
-                return
-        except ValueError:
-            pass
+        subject = " ".join(context.args)
 
-    try:
-        await context.bot.set_chat_permissions(chat_id=chat_id, permissions=STUDY_PERMISSIONS)
-    except Exception as e:
-        print(f"[Warn] Could not set chat permissions: {e}")
+    await r.set(f"subject:{chat_id}", subject)
+    await r.set(f"duration:{chat_id}", duration)
+    await r.set(f"status:{chat_id}", "idle")
 
-    await r.set(f"active_session:{chat_id}", duration, ex=(duration + 10) * 60)
-    await r.sadd(f"members:{chat_id}", f"{user.id}:{user.first_name}")
+    text = build_dashboard(subject, duration, "Ready to start")
+    reply_markup = build_keyboard(chat_id)
+    await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
 
-    keyboard = [[InlineKeyboardButton("✋ Join Session", callback_data=f"join_{chat_id}")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    msg = await update.message.reply_text(
-        f"⏳ **Study Session Started!**\n\n"
-        f"• Duration: **{duration} minutes**\n"
-        f"• Host: {user.first_name}\n"
-        f"• *Media, stickers, and GIFs are locked for focus.*\n\n"
-        f"Click below to join!",
-        reply_markup=reply_markup,
-        parse_mode="Markdown"
-    )
-
-    context.job_queue.run_once(
-        finish_session,
-        when=duration * 60,
-        data={"chat_id": chat_id, "duration": duration, "msg_id": msg.message_id},
-        name=f"study_{chat_id}"
-    )
-
-async def cancel_study(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    user = update.effective_user
-
-    # In groups, check if the sender is an admin or host
-    if update.effective_chat.type in ["group", "supergroup"]:
-        member = await context.bot.get_chat_member(chat_id, user.id)
-        if member.status not in ["creator", "administrator"]:
-            await update.message.reply_text("⚠️ Only group administrators can cancel an active study sprint.")
-            return
-
-    is_active = await r.get(f"active_session:{chat_id}")
-    if not is_active:
-        await update.message.reply_text("There is no active study session to cancel.")
-        return
-
-    # Cancel scheduled jobs (both focus timer and break timer if active)
-    current_jobs = context.job_queue.get_jobs_by_name(f"study_{chat_id}")
-    for job in current_jobs:
-        job.schedule_removal()
-
-    break_jobs = context.job_queue.get_jobs_by_name(f"break_{chat_id}")
-    for job in break_jobs:
-        job.schedule_removal()
-
-    # Clear state from Redis
-    await r.delete(f"active_session:{chat_id}")
-    await r.delete(f"members:{chat_id}")
-
-    # Restore group chat permissions
-    try:
-        await context.bot.set_chat_permissions(chat_id=chat_id, permissions=OPEN_PERMISSIONS)
-    except Exception as e:
-        print(f"[Warn] Could not restore chat permissions: {e}")
-
-    await update.message.reply_text(
-        f"🛑 **Session Cancelled by {user.first_name}.**\n\n"
-        f"Chat permissions have been unlocked. No minutes were logged for this session.",
-        parse_mode="Markdown"
-    )
-
-async def join_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    data = query.data
+    chat_id = update.effective_chat.id
     await query.answer()
 
-    chat_id = update.effective_chat.id
-    user = update.effective_user
+    subject = await r.get(f"subject:{chat_id}") or "Mathematics"
+    duration = int(await r.get(f"duration:{chat_id}") or 25)
 
-    is_active = await r.get(f"active_session:{chat_id}")
-    if not is_active:
-        await query.edit_message_text("This session has already ended or was cancelled.")
-        return
+    if data.startswith("start_"):
+        await r.set(f"status:{chat_id}", "running")
+        text = build_dashboard(subject, duration, "Focus session active")
+        await query.edit_message_text(text, reply_markup=build_keyboard(chat_id, is_paused=False), parse_mode="Markdown")
 
-    await r.sadd(f"members:{chat_id}", f"{user.id}:{user.first_name}")
-    members = await r.smembers(f"members:{chat_id}")
-    member_names = [m.split(":", 1)[1] for m in members]
+    elif data.startswith("pause_"):
+        await r.set(f"status:{chat_id}", "paused")
+        text = build_dashboard(subject, duration, "Session paused")
+        await query.edit_message_text(text, reply_markup=build_keyboard(chat_id, is_paused=True), parse_mode="Markdown")
 
-    duration = await r.get(f"active_session:{chat_id}")
-    keyboard = [[InlineKeyboardButton("✋ Join Session", callback_data=f"join_{chat_id}")]]
+    elif data.startswith("resume_"):
+        await r.set(f"status:{chat_id}", "running")
+        text = build_dashboard(subject, duration, "Focus session active")
+        await query.edit_message_text(text, reply_markup=build_keyboard(chat_id, is_paused=False), parse_mode="Markdown")
 
-    await query.edit_message_text(
-        f"⏳ **Study Session in Progress!**\n\n"
-        f"• Duration: **{duration} minutes**\n"
-        f"• *Media locked for focus.*\n"
-        f"• Active Participants ({len(member_names)}):\n  - " + "\n  - ".join(member_names),
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
+    elif data.startswith("reset_"):
+        await r.set(f"status:{chat_id}", "idle")
+        text = build_dashboard(subject, duration, "Session reset")
+        await query.edit_message_text(text, reply_markup=build_keyboard(chat_id, is_paused=False), parse_mode="Markdown")
 
-async def finish_session(context: ContextTypes.DEFAULT_TYPE):
-    data = context.job.data
-    chat_id = data["chat_id"]
-    duration = data["duration"]
+    elif data.startswith("set_25_"):
+        await r.set(f"duration:{chat_id}", 25)
+        text = build_dashboard(subject, 25, "Duration set to 25m")
+        await query.edit_message_text(text, reply_markup=build_keyboard(chat_id), parse_mode="Markdown")
 
-    members = await r.smembers(f"members:{chat_id}")
-    mentions = []
+    elif data.startswith("set_50_"):
+        await r.set(f"duration:{chat_id}", 50)
+        text = build_dashboard(subject, 50, "Duration set to 50m")
+        await query.edit_message_text(text, reply_markup=build_keyboard(chat_id), parse_mode="Markdown")
 
-    for member in members:
-        user_id, name = member.split(":", 1)
-        user_id = int(user_id)
-        mentions.append(f"[{name}](tg://user?id={user_id})")
-        await db_record_session(user_id, name, duration)
+    elif data.startswith("join_"):
+        user = update.effective_user
+        await r.sadd(f"members:{chat_id}", user.first_name)
+        members = await r.smembers(f"members:{chat_id}")
+        await query.message.reply_text(f"✋ {user.first_name} joined! Total in room: {len(members)}")
 
-    await r.delete(f"active_session:{chat_id}")
-    await r.delete(f"members:{chat_id}")
-
-    try:
-        await context.bot.set_chat_permissions(chat_id=chat_id, permissions=OPEN_PERMISSIONS)
-    except Exception as e:
-        print(f"[Warn] Could not restore chat permissions: {e}")
-
-    break_duration = 5
-    ping_list = ", ".join(mentions) if mentions else "Everyone"
-
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=f"🔔 **Focus Complete! Break Time!**\n\n"
-             f"Great focus session, {ping_list}!\n"
-             f"☕ Chat permissions unlocked. Take a **{break_duration}-minute break**.",
-        parse_mode="Markdown"
-    )
-
-    context.job_queue.run_once(
-        finish_break,
-        when=break_duration * 60,
-        data={"chat_id": chat_id},
-        name=f"break_{chat_id}"
-    )
-
-async def finish_break(context: ContextTypes.DEFAULT_TYPE):
-    chat_id = context.job.data["chat_id"]
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="☕ **Break is over!**\n\nReady for another round? Use `/study 25` to begin.",
-        parse_mode="Markdown"
-    )
-
-async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    row = await db_get_user_stats(user.id)
-
-    if not row:
-        await update.message.reply_text(
-            f"You haven't logged any study sessions yet, {user.first_name}! Use `/study 25` to begin.",
-            parse_mode="Markdown"
-        )
-        return
-
-    name, minutes, streak, last_date = row
-    hours = round(minutes / 60, 1)
-
-    stats_text = (
-        f"📊 **Personal Focus Stats: {name}**\n\n"
-        f"• **Total Study Time:** {hours} hrs ({minutes} mins)\n"
-        f"• **Current Streak:** 🔥 {streak} day{'s' if streak > 1 else ''}\n"
-        f"• **Last Active Session:** {last_date or 'Today'}"
-    )
-    await update.message.reply_text(stats_text, parse_mode="Markdown")
-
-async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT username, total_minutes, current_streak FROM users ORDER BY total_minutes DESC LIMIT 5"
-        )
-        rows = await cursor.fetchall()
-
-    if not rows:
-        await update.message.reply_text("No study records found yet. Run `/study 25` to get started!")
-        return
-
-    text = "🏆 **Study Room Leaderboard**\n\n"
-    for rank, (name, minutes, streak) in enumerate(rows, 1):
-        hours = round(minutes / 60, 1)
-        text += f"{rank}. **{name}** — {hours} hrs | 🔥 {streak} day streak\n"
-
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-# --- App Runner ---
+# --- Main App ---
 def main():
     asyncio.run(init_db())
 
@@ -350,13 +163,9 @@ def main():
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("study", start_study))
-    app.add_handler(CommandHandler("cancel", cancel_study))
-    app.add_handler(CommandHandler("stats", my_stats))
-    app.add_handler(CommandHandler("leaderboard", leaderboard))
-    app.add_handler(CallbackQueryHandler(join_session, pattern=r"^join_"))
+    app.add_handler(CommandHandler("panel", panel_command))
+    app.add_handler(CommandHandler("study", panel_command))
+    app.add_handler(CallbackQueryHandler(button_router))
 
     print("Study Room Bot is running... Press Ctrl+C to stop.")
     app.run_polling()
