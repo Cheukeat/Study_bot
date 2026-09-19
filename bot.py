@@ -80,10 +80,9 @@ async def init_db():
 
 # --- Visual Component Builders ---
 
-def make_progress_bar(remaining_sec: int, total_sec: int, bar_length: int = 12) -> str:
-    """Calculates exact mathematical progress bar based on seconds."""
+def make_progress_bar(remaining_sec: int, total_sec: int, bar_length: int = 10) -> str:
     if total_sec <= 0:
-        return "▰" * bar_length + " `100%`"
+        return "▰" * bar_length + " 100%"
     
     elapsed_sec = max(0, total_sec - remaining_sec)
     ratio = min(1.0, max(0.0, elapsed_sec / float(total_sec)))
@@ -93,7 +92,7 @@ def make_progress_bar(remaining_sec: int, total_sec: int, bar_length: int = 12) 
     unfilled = "▱" * (bar_length - filled_len)
     percent = int(ratio * 100)
     
-    return f"[{filled}{unfilled}] `{percent}%`"
+    return f"{filled}{unfilled} {percent}%"
 
 def render_dashboard(subject: str, remaining_sec: int, total_sec: int, state: str, members: list) -> str:
     progress = make_progress_bar(remaining_sec, total_sec)
@@ -103,39 +102,37 @@ def render_dashboard(subject: str, remaining_sec: int, total_sec: int, state: st
     time_str = f"{mins:02d}:{secs:02d}"
 
     if state == "running":
-        badge = "🟢 FOCUS SPRINT IN PROGRESS"
+        badge = "🟢 SPRINT IN PROGRESS"
     elif state == "paused":
         badge = "🟡 SESSION PAUSED"
     elif state == "done":
-        badge = "🎉 SPRINT COMPLETE • BREAK TIME"
+        badge = "🎉 COMPLETE • BREAK TIME"
     else:
-        badge = "⚪ STANDBY • READY TO LAUNCH"
+        badge = "⚪ STANDBY • READY TO START"
 
     if members:
         squad_preview = " • ".join(members[:4])
         if len(members) > 4:
             squad_preview += f" +{len(members) - 4} more"
-        squad_line = f"👥 **Squad ({len(members)}):** {squad_preview}"
+        squad_line = f"👥 *Squad ({len(members)}):* {squad_preview}"
     else:
-        squad_line = "👥 **Squad:** _No one has joined yet_"
+        squad_line = "👥 *Squad:* _No one has joined yet_"
 
     total_mins = total_sec // 60
 
     return (
-        f"╔══════════════════════════╗\n"
-        f"       ⚡ **STUDY ROOM ASSISTANT** ⚡\n"
-        f"╚══════════════════════════╝\n\n"
-        f"🎯 **Target:** `{subject}`\n"
-        f"📡 **Status:** {badge}\n\n"
+        f"⚡ *STUDY ROOM ASSISTANT* ⚡\n\n"
+        f"🎯 *Target:* `{subject}`\n"
+        f"📡 *Status:* {badge}\n\n"
         f"```text\n"
         f"┌─────────────────────────┐\n"
         f"│        ⏳ {time_str}         │\n"
         f"└─────────────────────────┘\n"
         f"```\n"
-        f"Progress: {progress} ({time_str} / {total_mins:02d}:00)\n\n"
+        f"📊 *Progress:* `{progress}` `({time_str} / {total_mins:02d}:00)`\n\n"
         f"{squad_line}\n"
         f"───────────────────────────\n"
-        f"💡 _Tip: Use `/set 15` or `/set Physics 30` to edit via text!_\n"
+        f"💡 _Tip: Use /set 15 or click buttons to adjust!_\n"
     )
 
 def render_keyboard(chat_id: int, is_running: bool = False, is_paused: bool = False):
@@ -148,10 +145,10 @@ def render_keyboard(chat_id: int, is_running: bool = False, is_paused: bool = Fa
                 InlineKeyboardButton("📖 Read", callback_data=f"sub_Read_{chat_id}"),
             ],
             [
-                InlineKeyboardButton("➕ +5m", callback_data=f"add_5_{chat_id}"),
-                InlineKeyboardButton("➖ -5m", callback_data=f"sub_5_{chat_id}"),
-                InlineKeyboardButton("➕ +1m", callback_data=f"add_1_{chat_id}"),
-                InlineKeyboardButton("➖ -1m", callback_data=f"sub_1_{chat_id}"),
+                InlineKeyboardButton("➕ +5m", callback_data=f"add5_{chat_id}"),
+                InlineKeyboardButton("➖ -5m", callback_data=f"sub5_{chat_id}"),
+                InlineKeyboardButton("➕ +1m", callback_data=f"add1_{chat_id}"),
+                InlineKeyboardButton("➖ -1m", callback_data=f"sub1_{chat_id}"),
             ]
         ])
 
@@ -165,13 +162,13 @@ def render_keyboard(chat_id: int, is_running: bool = False, is_paused: bool = Fa
         [
             control_btn,
             InlineKeyboardButton("🔄 Reset", callback_data=f"reset_{chat_id}"),
-            InlineKeyboardButton("✋ Join Squad", callback_data=f"join_{chat_id}"),
+            InlineKeyboardButton("✋ Join", callback_data=f"join_{chat_id}"),
         ],
         [
-            InlineKeyboardButton("➕ +5m", callback_data=f"add_5_{chat_id}"),
-            InlineKeyboardButton("➖ -5m", callback_data=f"sub_5_{chat_id}"),
-            InlineKeyboardButton("➕ +1m", callback_data=f"add_1_{chat_id}"),
-            InlineKeyboardButton("➖ -1m", callback_data=f"sub_1_{chat_id}"),
+            InlineKeyboardButton("➕ +5m", callback_data=f"add5_{chat_id}"),
+            InlineKeyboardButton("➖ -5m", callback_data=f"sub5_{chat_id}"),
+            InlineKeyboardButton("➕ +1m", callback_data=f"add1_{chat_id}"),
+            InlineKeyboardButton("➖ -1m", callback_data=f"sub1_{chat_id}"),
         ]
     ])
 
@@ -191,7 +188,7 @@ async def timer_tick_job(context: ContextTypes.DEFAULT_TYPE):
     subject = await r.get(f"subject:{chat_id}") or "General Focus"
     members = list(await r.smembers(f"members:{chat_id}"))
 
-    # Tick down by 60 seconds
+    # Decrement by 60s
     remaining_sec -= 60
 
     if remaining_sec <= 0:
@@ -213,12 +210,13 @@ async def timer_tick_job(context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=render_keyboard(chat_id, is_running=False),
                 parse_mode="Markdown"
             )
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Warn] edit error: {e}")
 
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"🔔 **Focus Complete!** Outstanding sprint on **{subject}**.\n☕ Permissions unlocked. Take a 5-minute break!"
+            text=f"🔔 *Focus Complete!* Great session on *{subject}*.\n☕ Take a 5-minute break!",
+            parse_mode="Markdown"
         )
         return
 
@@ -233,8 +231,8 @@ async def timer_tick_job(context: ContextTypes.DEFAULT_TYPE):
             reply_markup=render_keyboard(chat_id, is_running=True, is_paused=False),
             parse_mode="Markdown"
         )
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[Warn] tick edit error: {e}")
 
 # --- Command Handlers ---
 
@@ -252,7 +250,9 @@ async def study_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             subject = " ".join(context.args)
 
+    duration_min = max(1, min(180, duration_min))
     total_sec = duration_min * 60
+
     await r.set(f"subject:{chat_id}", subject)
     await r.set(f"total_sec:{chat_id}", total_sec)
     await r.set(f"remaining_sec:{chat_id}", total_sec)
@@ -268,7 +268,6 @@ async def study_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await r.set(f"msg_id:{chat_id}", msg.message_id)
 
 async def set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Allows setting time and subject via `/set 15` or `/set Physics 30`."""
     chat_id = update.effective_chat.id
     if not context.args:
         await update.message.reply_text("Usage: `/set 15` or `/set Biology 45`", parse_mode="Markdown")
@@ -308,7 +307,7 @@ async def set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=reply_markup,
                 parse_mode="Markdown"
             )
-            await update.message.reply_text(f"✅ Dashboard updated to **{subject}** ({total_sec // 60}m)!", parse_mode="Markdown")
+            await update.message.reply_text(f"✅ Dashboard updated: *{subject}* ({total_sec // 60}m)", parse_mode="Markdown")
             return
         except Exception:
             pass
@@ -321,7 +320,6 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     chat_id = update.effective_chat.id
     user = update.effective_user
-    await query.answer()
 
     subject = await r.get(f"subject:{chat_id}") or "Mathematics"
     remaining_sec = int(await r.get(f"remaining_sec:{chat_id}") or 1500)
@@ -329,6 +327,8 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = await r.get(f"status:{chat_id}") or "idle"
     msg_id = int(await r.get(f"msg_id:{chat_id}") or query.message.message_id)
     members = list(await r.smembers(f"members:{chat_id}"))
+
+    toast_msg = None
 
     if data.startswith("start_"):
         await r.set(f"status:{chat_id}", "running")
@@ -347,9 +347,8 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data={"chat_id": chat_id, "msg_id": msg_id},
             name=f"tick_{chat_id}"
         )
-
-        text = render_dashboard(subject, remaining_sec, total_sec, "running", members)
-        await query.edit_message_text(text, reply_markup=render_keyboard(chat_id, is_running=True, is_paused=False), parse_mode="Markdown")
+        status = "running"
+        toast_msg = "🚀 Sprint started!"
 
     elif data.startswith("pause_"):
         await r.set(f"status:{chat_id}", "paused")
@@ -357,9 +356,8 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.set_chat_permissions(chat_id=chat_id, permissions=OPEN_PERMISSIONS)
         except Exception:
             pass
-
-        text = render_dashboard(subject, remaining_sec, total_sec, "paused", members)
-        await query.edit_message_text(text, reply_markup=render_keyboard(chat_id, is_running=True, is_paused=True), parse_mode="Markdown")
+        status = "paused"
+        toast_msg = "⏸ Paused"
 
     elif data.startswith("resume_"):
         await r.set(f"status:{chat_id}", "running")
@@ -367,32 +365,31 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.set_chat_permissions(chat_id=chat_id, permissions=STUDY_PERMISSIONS)
         except Exception:
             pass
-
-        text = render_dashboard(subject, remaining_sec, total_sec, "running", members)
-        await query.edit_message_text(text, reply_markup=render_keyboard(chat_id, is_running=True, is_paused=False), parse_mode="Markdown")
+        status = "running"
+        toast_msg = "▶️ Resumed"
 
     elif data.startswith("reset_"):
         for job in context.job_queue.get_jobs_by_name(f"tick_{chat_id}"):
             job.schedule_removal()
 
+        status = "idle"
+        remaining_sec = total_sec
         await r.set(f"status:{chat_id}", "idle")
         await r.set(f"remaining_sec:{chat_id}", total_sec)
         try:
             await context.bot.set_chat_permissions(chat_id=chat_id, permissions=OPEN_PERMISSIONS)
         except Exception:
             pass
-
-        text = render_dashboard(subject, total_sec, total_sec, "idle", members)
-        await query.edit_message_text(text, reply_markup=render_keyboard(chat_id, is_running=False), parse_mode="Markdown")
+        toast_msg = "🔄 Reset"
 
     elif data.startswith("sub_"):
         new_sub = data.split("_")[1]
+        subject = new_sub
         await r.set(f"subject:{chat_id}", new_sub)
-        text = render_dashboard(new_sub, remaining_sec, total_sec, status, members)
-        await query.edit_message_text(text, reply_markup=render_keyboard(chat_id, is_running=(status != "idle"), is_paused=(status == "paused")), parse_mode="Markdown")
+        toast_msg = f"Subject: {new_sub}"
 
-    # Time modification handlers
-    elif data.startswith("add_5_"):
+    # --- Robust Time Adjustments ---
+    elif data.startswith("add5_"):
         remaining_sec = min(180 * 60, remaining_sec + 300)
         if status == "idle":
             total_sec = remaining_sec
@@ -400,22 +397,22 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             total_sec = max(total_sec, remaining_sec)
         await r.set(f"remaining_sec:{chat_id}", remaining_sec)
         await r.set(f"total_sec:{chat_id}", total_sec)
-        text = render_dashboard(subject, remaining_sec, total_sec, status, members)
-        await query.edit_message_text(text, reply_markup=render_keyboard(chat_id, is_running=(status != "idle"), is_paused=(status == "paused")), parse_mode="Markdown")
+        toast_msg = f"⏱️ +5m ({remaining_sec // 60}m)"
 
-    elif data.startswith("sub_5_"):
+    elif data.startswith("sub5_"):
         if remaining_sec > 300:
             remaining_sec -= 300
         else:
-            remaining_sec = max(60, remaining_sec - 60)  # Step down by 1m if <= 5m
+            # If 5m or less, step down by 1m (minimum 1m = 60s)
+            remaining_sec = max(60, remaining_sec - 60)
+        
         if status == "idle":
             total_sec = remaining_sec
         await r.set(f"remaining_sec:{chat_id}", remaining_sec)
         await r.set(f"total_sec:{chat_id}", total_sec)
-        text = render_dashboard(subject, remaining_sec, total_sec, status, members)
-        await query.edit_message_text(text, reply_markup=render_keyboard(chat_id, is_running=(status != "idle"), is_paused=(status == "paused")), parse_mode="Markdown")
+        toast_msg = f"⏱️ -5m ({remaining_sec // 60}m)"
 
-    elif data.startswith("add_1_"):
+    elif data.startswith("add1_"):
         remaining_sec = min(180 * 60, remaining_sec + 60)
         if status == "idle":
             total_sec = remaining_sec
@@ -423,23 +420,37 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             total_sec = max(total_sec, remaining_sec)
         await r.set(f"remaining_sec:{chat_id}", remaining_sec)
         await r.set(f"total_sec:{chat_id}", total_sec)
-        text = render_dashboard(subject, remaining_sec, total_sec, status, members)
-        await query.edit_message_text(text, reply_markup=render_keyboard(chat_id, is_running=(status != "idle"), is_paused=(status == "paused")), parse_mode="Markdown")
+        toast_msg = f"⏱️ +1m ({remaining_sec // 60}m)"
 
-    elif data.startswith("sub_1_"):
+    elif data.startswith("sub1_"):
         remaining_sec = max(60, remaining_sec - 60)
         if status == "idle":
             total_sec = remaining_sec
         await r.set(f"remaining_sec:{chat_id}", remaining_sec)
         await r.set(f"total_sec:{chat_id}", total_sec)
-        text = render_dashboard(subject, remaining_sec, total_sec, status, members)
-        await query.edit_message_text(text, reply_markup=render_keyboard(chat_id, is_running=(status != "idle"), is_paused=(status == "paused")), parse_mode="Markdown")
+        toast_msg = f"⏱️ -1m ({remaining_sec // 60}m)"
 
     elif data.startswith("join_"):
         await r.sadd(f"members:{chat_id}", user.first_name)
         members = list(await r.smembers(f"members:{chat_id}"))
-        text = render_dashboard(subject, remaining_sec, total_sec, status, members)
-        await query.edit_message_text(text, reply_markup=render_keyboard(chat_id, is_running=(status != "idle"), is_paused=(status == "paused")), parse_mode="Markdown")
+        toast_msg = f"✋ {user.first_name} joined!"
+
+    # Answer query with toast notification
+    if toast_msg:
+        await query.answer(toast_msg)
+    else:
+        await query.answer()
+
+    # Re-render card
+    is_running = (status == "running")
+    is_paused = (status == "paused")
+    text = render_dashboard(subject, remaining_sec, total_sec, status, members)
+    reply_markup = render_keyboard(chat_id, is_running=is_running, is_paused=is_paused)
+
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+    except Exception as e:
+        print(f"[Error editing message]: {e}")
 
 # --- App Runner ---
 def main():
