@@ -20,7 +20,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 DB_PATH = "study_room.db"
 
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN environment variable not set. Add it in Render's Environment settings.")
+    raise ValueError("BOT_TOKEN environment variable not set. Add it in your .env file or Render settings.")
 
 # In-memory Redis simulation
 r = FakeAsyncRedis(decode_responses=True)
@@ -28,7 +28,7 @@ r = FakeAsyncRedis(decode_responses=True)
 # Permission Profiles
 STUDY_PERMISSIONS = ChatPermissions(
     can_send_messages=True,
-    can_send_other_messages=False,  # Blocks stickers, GIFs, animations, games
+    can_send_other_messages=False,
     can_send_photos=False,
     can_send_videos=False,
     can_send_documents=False,
@@ -50,16 +50,15 @@ OPEN_PERMISSIONS = ChatPermissions(
     can_add_web_page_previews=True,
 )
 
-# --- Minimal HTTP Server for Render Free Tier ---
+# --- Minimal HTTP Server for Render Health Checks ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"Study Room Bot is running!")
+        self.wfile.write(b"Study Room Bot is alive!")
 
     def log_message(self, format, *args):
-        # Silence default HTTP access logs in terminal
         return
 
 def run_health_server():
@@ -81,19 +80,89 @@ async def init_db():
         """)
         await db.commit()
 
+# --- Core SQLite Helpers ---
+
+async def db_get_user_stats(user_id: int):
+    """Core pattern: Read user record using parameterized query."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT username, total_minutes, current_streak, last_study_date FROM users WHERE user_id = ?",
+            (user_id,)
+        )
+        return await cursor.fetchone()
+
+async def db_record_session(user_id: int, username: str, duration: int):
+    """Core pattern: Read, calculate streak, and write (INSERT/UPDATE + commit)."""
+    today = datetime.date.today().isoformat()
+    yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT current_streak, last_study_date FROM users WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
+
+        if not row:
+            await db.execute(
+                "INSERT INTO users (user_id, username, total_minutes, current_streak, last_study_date) VALUES (?, ?, ?, ?, ?)",
+                (user_id, username, duration, 1, today)
+            )
+        else:
+            streak, last_date = row
+            if last_date != today:
+                streak = streak + 1 if last_date == yesterday else 1
+
+            await db.execute(
+                "UPDATE users SET total_minutes = total_minutes + ?, current_streak = ?, last_study_date = ?, username = ? WHERE user_id = ?",
+                (duration, streak, today, username, user_id)
+            )
+        await db.commit()
+
 # --- Bot Command Handlers ---
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    welcome_text = (
+        f"👋 Hello, **{user.first_name}**!\n\n"
+        f"Welcome to the **Study Room Assistant**.\n"
+        f"I help groups run synchronized Pomodoro sprints and stay productive.\n\n"
+        f"**Available Commands:**\n"
+        f"• `/study [minutes]` - Start a timed sprint (e.g. `/study 25`)\n"
+        f"• `/stats` - View your personal completed hours and streak\n"
+        f"• `/leaderboard` - Show the top room participants\n\n"
+        f"Add me to your study group and make me an **Admin** to enable media lock mode during sprints!"
+    )
+    await update.message.reply_text(welcome_text, parse_mode="Markdown")
+
+async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    row = await db_get_user_stats(user.id)
+
+    if not row:
+        await update.message.reply_text(
+            f"You haven't logged any study sessions yet, {user.first_name}! Use `/study 25` to begin.",
+            parse_mode="Markdown"
+        )
+        return
+
+    name, minutes, streak, last_date = row
+    hours = round(minutes / 60, 1)
+
+    stats_text = (
+        f"📊 **Personal Focus Stats: {name}**\n\n"
+        f"• **Total Study Time:** {hours} hrs ({minutes} mins)\n"
+        f"• **Current Streak:** 🔥 {streak} day{'s' if streak > 1 else ''}\n"
+        f"• **Last Active Session:** {last_date or 'Today'}"
+    )
+    await update.message.reply_text(stats_text, parse_mode="Markdown")
 
 async def start_study(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user
 
-    # Prevent concurrent sessions in the same group
     is_active = await r.get(f"active_session:{chat_id}")
     if is_active:
         await update.message.reply_text("⚠️ A study session is already active in this room!")
         return
 
-    # Parse duration (default: 25 mins)
     duration = 25
     if context.args:
         try:
@@ -104,13 +173,11 @@ async def start_study(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             pass
 
-    # Restrict media & stickers in the group
     try:
         await context.bot.set_chat_permissions(chat_id=chat_id, permissions=STUDY_PERMISSIONS)
     except Exception as e:
         print(f"[Warn] Could not set chat permissions: {e}")
 
-    # Initialize state in Redis
     await r.set(f"active_session:{chat_id}", duration, ex=(duration + 10) * 60)
     await r.sadd(f"members:{chat_id}", f"{user.id}:{user.first_name}")
 
@@ -127,7 +194,6 @@ async def start_study(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-    # Schedule completion job
     context.job_queue.run_once(
         finish_session,
         when=duration * 60,
@@ -169,47 +235,23 @@ async def finish_session(context: ContextTypes.DEFAULT_TYPE):
     duration = data["duration"]
 
     members = await r.smembers(f"members:{chat_id}")
-    today = datetime.date.today().isoformat()
     mentions = []
 
-    # Record completed minutes & streaks in SQLite
-    async with aiosqlite.connect(DB_PATH) as db:
-        for member in members:
-            user_id, name = member.split(":", 1)
-            user_id = int(user_id)
-            mentions.append(f"[{name}](tg://user?id={user_id})")
+    for member in members:
+        user_id, name = member.split(":", 1)
+        user_id = int(user_id)
+        mentions.append(f"[{name}](tg://user?id={user_id})")
+        await db_record_session(user_id, name, duration)
 
-            cursor = await db.execute("SELECT current_streak, last_study_date FROM users WHERE user_id = ?", (user_id,))
-            row = await cursor.fetchone()
-
-            if not row:
-                await db.execute(
-                    "INSERT INTO users (user_id, username, total_minutes, current_streak, last_study_date) VALUES (?, ?, ?, ?, ?)",
-                    (user_id, name, duration, 1, today)
-                )
-            else:
-                streak, last_date = row
-                if last_date != today:
-                    yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
-                    streak = streak + 1 if last_date == yesterday else 1
-
-                await db.execute(
-                    "UPDATE users SET total_minutes = total_minutes + ?, current_streak = ?, last_study_date = ?, username = ? WHERE user_id = ?",
-                    (duration, streak, today, name, user_id)
-                )
-        await db.commit()
-
-    # Clear active Redis state
     await r.delete(f"active_session:{chat_id}")
     await r.delete(f"members:{chat_id}")
 
-    # Unlock chat permissions
     try:
         await context.bot.set_chat_permissions(chat_id=chat_id, permissions=OPEN_PERMISSIONS)
     except Exception as e:
         print(f"[Warn] Could not restore chat permissions: {e}")
 
-    break_duration = 5  # minutes
+    break_duration = 5
     ping_list = ", ".join(mentions) if mentions else "Everyone"
 
     await context.bot.send_message(
@@ -243,7 +285,7 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rows = await cursor.fetchall()
 
     if not rows:
-        await update.message.reply_text("No study records found. Start with `/study 25`!")
+        await update.message.reply_text("No study records found yet. Run `/study 25` to get started!")
         return
 
     text = "🏆 **Study Room Leaderboard**\n\n"
@@ -257,12 +299,13 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     asyncio.run(init_db())
 
-    # Start the dummy HTTP server in a separate thread so Render's health check passes
     server_thread = threading.Thread(target=run_health_server, daemon=True)
     server_thread.start()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("stats", my_stats))
     app.add_handler(CommandHandler("study", start_study))
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CallbackQueryHandler(join_session, pattern=r"^join_"))
