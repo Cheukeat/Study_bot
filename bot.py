@@ -9,9 +9,7 @@ from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     CallbackQueryHandler,
-    MessageHandler,
     ContextTypes,
-    filters,
 )
 from fakeredis import FakeAsyncRedis
 import aiosqlite
@@ -82,19 +80,28 @@ async def init_db():
 
 # --- Visual Component Builders ---
 
-def make_progress_bar(current: int, total: int, bar_length: int = 10) -> str:
-    if total <= 0:
-        return "▰" * bar_length + " 100%"
-    elapsed = max(0, total - current)
-    filled_len = int(round(bar_length * elapsed / float(total)))
+def make_progress_bar(remaining_sec: int, total_sec: int, bar_length: int = 12) -> str:
+    """Calculates exact mathematical progress bar based on seconds."""
+    if total_sec <= 0:
+        return "▰" * bar_length + " `100%`"
+    
+    elapsed_sec = max(0, total_sec - remaining_sec)
+    ratio = min(1.0, max(0.0, elapsed_sec / float(total_sec)))
+    
+    filled_len = int(round(bar_length * ratio))
     filled = "▰" * filled_len
     unfilled = "▱" * (bar_length - filled_len)
-    percent = int(round((elapsed / float(total)) * 100))
-    return f"{filled}{unfilled} `{percent}%`"
-
-def render_dashboard(subject: str, remaining: int, total: int, state: str, members: list) -> str:
-    progress = make_progress_bar(remaining, total)
+    percent = int(ratio * 100)
     
+    return f"[{filled}{unfilled}] `{percent}%`"
+
+def render_dashboard(subject: str, remaining_sec: int, total_sec: int, state: str, members: list) -> str:
+    progress = make_progress_bar(remaining_sec, total_sec)
+    
+    mins = remaining_sec // 60
+    secs = remaining_sec % 60
+    time_str = f"{mins:02d}:{secs:02d}"
+
     if state == "running":
         badge = "🟢 FOCUS SPRINT IN PROGRESS"
     elif state == "paused":
@@ -112,6 +119,8 @@ def render_dashboard(subject: str, remaining: int, total: int, state: str, membe
     else:
         squad_line = "👥 **Squad:** _No one has joined yet_"
 
+    total_mins = total_sec // 60
+
     return (
         f"╔══════════════════════════╗\n"
         f"       ⚡ **STUDY ROOM ASSISTANT** ⚡\n"
@@ -120,13 +129,13 @@ def render_dashboard(subject: str, remaining: int, total: int, state: str, membe
         f"📡 **Status:** {badge}\n\n"
         f"```text\n"
         f"┌─────────────────────────┐\n"
-        f"│       ⏳ {remaining:02d}:00          │\n"
+        f"│        ⏳ {time_str}         │\n"
         f"└─────────────────────────┘\n"
         f"```\n"
-        f"Progress: {progress}\n\n"
+        f"Progress: {progress} ({time_str} / {total_mins:02d}:00)\n\n"
         f"{squad_line}\n"
         f"───────────────────────────\n"
-        f"💡 _Tip: Reply with `/set 15` or send `Physics 30` to customize!_\n"
+        f"💡 _Tip: Use `/set 15` or `/set Physics 30` to edit via text!_\n"
     )
 
 def render_keyboard(chat_id: int, is_running: bool = False, is_paused: bool = False):
@@ -177,24 +186,25 @@ async def timer_tick_job(context: ContextTypes.DEFAULT_TYPE):
     if status != "running":
         return
 
-    remaining = int(await r.get(f"remaining:{chat_id}") or 0)
-    total = int(await r.get(f"total:{chat_id}") or 25)
+    remaining_sec = int(await r.get(f"remaining_sec:{chat_id}") or 0)
+    total_sec = int(await r.get(f"total_sec:{chat_id}") or 1500)
     subject = await r.get(f"subject:{chat_id}") or "General Focus"
     members = list(await r.smembers(f"members:{chat_id}"))
 
-    remaining -= 1
+    # Tick down by 60 seconds
+    remaining_sec -= 60
 
-    if remaining <= 0:
+    if remaining_sec <= 0:
         context.job.schedule_removal()
         await r.set(f"status:{chat_id}", "idle")
-        await r.delete(f"remaining:{chat_id}")
+        await r.set(f"remaining_sec:{chat_id}", 0)
 
         try:
             await context.bot.set_chat_permissions(chat_id=chat_id, permissions=OPEN_PERMISSIONS)
         except Exception:
             pass
 
-        text = render_dashboard(subject, 0, total, "done", members)
+        text = render_dashboard(subject, 0, total_sec, "done", members)
         try:
             await context.bot.edit_message_text(
                 text=text,
@@ -212,9 +222,9 @@ async def timer_tick_job(context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await r.set(f"remaining:{chat_id}", remaining)
+    await r.set(f"remaining_sec:{chat_id}", remaining_sec)
 
-    text = render_dashboard(subject, remaining, total, "running", members)
+    text = render_dashboard(subject, remaining_sec, total_sec, "running", members)
     try:
         await context.bot.edit_message_text(
             text=text,
@@ -226,31 +236,32 @@ async def timer_tick_job(context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-# --- Command & Message Handlers ---
+# --- Command Handlers ---
 
 async def study_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user
     subject = "Mathematics"
-    duration = 25
+    duration_min = 25
 
     if context.args:
         if context.args[-1].isdigit():
-            duration = int(context.args[-1])
+            duration_min = int(context.args[-1])
             if len(context.args) > 1:
                 subject = " ".join(context.args[:-1])
         else:
             subject = " ".join(context.args)
 
+    total_sec = duration_min * 60
     await r.set(f"subject:{chat_id}", subject)
-    await r.set(f"total:{chat_id}", duration)
-    await r.set(f"remaining:{chat_id}", duration)
+    await r.set(f"total_sec:{chat_id}", total_sec)
+    await r.set(f"remaining_sec:{chat_id}", total_sec)
     await r.set(f"status:{chat_id}", "idle")
     await r.delete(f"members:{chat_id}")
     await r.sadd(f"members:{chat_id}", user.first_name)
 
     members = [user.first_name]
-    text = render_dashboard(subject, duration, duration, "idle", members)
+    text = render_dashboard(subject, total_sec, total_sec, "idle", members)
     reply_markup = render_keyboard(chat_id, is_running=False)
     msg = await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
 
@@ -264,29 +275,28 @@ async def set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     subject = await r.get(f"subject:{chat_id}") or "Mathematics"
-    remaining = int(await r.get(f"remaining:{chat_id}") or 25)
-    total = int(await r.get(f"total:{chat_id}") or 25)
     status = await r.get(f"status:{chat_id}") or "idle"
     members = list(await r.smembers(f"members:{chat_id}"))
     msg_id = await r.get(f"msg_id:{chat_id}")
 
     if context.args[-1].isdigit():
-        new_duration = int(context.args[-1])
-        new_duration = max(1, min(180, new_duration))
-        remaining = new_duration
-        total = new_duration
+        new_min = max(1, min(180, int(context.args[-1])))
+        total_sec = new_min * 60
+        remaining_sec = total_sec
         if len(context.args) > 1:
             subject = " ".join(context.args[:-1])
     else:
         subject = " ".join(context.args)
+        total_sec = int(await r.get(f"total_sec:{chat_id}") or 1500)
+        remaining_sec = int(await r.get(f"remaining_sec:{chat_id}") or 1500)
 
     await r.set(f"subject:{chat_id}", subject)
-    await r.set(f"remaining:{chat_id}", remaining)
-    await r.set(f"total:{chat_id}", total)
+    await r.set(f"total_sec:{chat_id}", total_sec)
+    await r.set(f"remaining_sec:{chat_id}", remaining_sec)
 
     is_running = (status == "running")
     is_paused = (status == "paused")
-    text = render_dashboard(subject, remaining, total, status, members)
+    text = render_dashboard(subject, remaining_sec, total_sec, status, members)
     reply_markup = render_keyboard(chat_id, is_running=is_running, is_paused=is_paused)
 
     if msg_id:
@@ -298,12 +308,11 @@ async def set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=reply_markup,
                 parse_mode="Markdown"
             )
-            await update.message.reply_text(f"✅ Updated dashboard to **{subject}** ({remaining} min)!", parse_mode="Markdown")
+            await update.message.reply_text(f"✅ Dashboard updated to **{subject}** ({total_sec // 60}m)!", parse_mode="Markdown")
             return
         except Exception:
             pass
 
-    # If previous card not found, post a fresh one
     new_msg = await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
     await r.set(f"msg_id:{chat_id}", new_msg.message_id)
 
@@ -315,8 +324,8 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     subject = await r.get(f"subject:{chat_id}") or "Mathematics"
-    remaining = int(await r.get(f"remaining:{chat_id}") or 25)
-    total = int(await r.get(f"total:{chat_id}") or 25)
+    remaining_sec = int(await r.get(f"remaining_sec:{chat_id}") or 1500)
+    total_sec = int(await r.get(f"total_sec:{chat_id}") or 1500)
     status = await r.get(f"status:{chat_id}") or "idle"
     msg_id = int(await r.get(f"msg_id:{chat_id}") or query.message.message_id)
     members = list(await r.smembers(f"members:{chat_id}"))
@@ -339,7 +348,7 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             name=f"tick_{chat_id}"
         )
 
-        text = render_dashboard(subject, remaining, total, "running", members)
+        text = render_dashboard(subject, remaining_sec, total_sec, "running", members)
         await query.edit_message_text(text, reply_markup=render_keyboard(chat_id, is_running=True, is_paused=False), parse_mode="Markdown")
 
     elif data.startswith("pause_"):
@@ -349,7 +358,7 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-        text = render_dashboard(subject, remaining, total, "paused", members)
+        text = render_dashboard(subject, remaining_sec, total_sec, "paused", members)
         await query.edit_message_text(text, reply_markup=render_keyboard(chat_id, is_running=True, is_paused=True), parse_mode="Markdown")
 
     elif data.startswith("resume_"):
@@ -359,7 +368,7 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-        text = render_dashboard(subject, remaining, total, "running", members)
+        text = render_dashboard(subject, remaining_sec, total_sec, "running", members)
         await query.edit_message_text(text, reply_markup=render_keyboard(chat_id, is_running=True, is_paused=False), parse_mode="Markdown")
 
     elif data.startswith("reset_"):
@@ -367,57 +376,69 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             job.schedule_removal()
 
         await r.set(f"status:{chat_id}", "idle")
-        await r.set(f"remaining:{chat_id}", total)
+        await r.set(f"remaining_sec:{chat_id}", total_sec)
         try:
             await context.bot.set_chat_permissions(chat_id=chat_id, permissions=OPEN_PERMISSIONS)
         except Exception:
             pass
 
-        text = render_dashboard(subject, total, total, "idle", members)
+        text = render_dashboard(subject, total_sec, total_sec, "idle", members)
         await query.edit_message_text(text, reply_markup=render_keyboard(chat_id, is_running=False), parse_mode="Markdown")
 
     elif data.startswith("sub_"):
         new_sub = data.split("_")[1]
         await r.set(f"subject:{chat_id}", new_sub)
-        text = render_dashboard(new_sub, remaining, total, status, members)
+        text = render_dashboard(new_sub, remaining_sec, total_sec, status, members)
         await query.edit_message_text(text, reply_markup=render_keyboard(chat_id, is_running=(status != "idle"), is_paused=(status == "paused")), parse_mode="Markdown")
 
-    # Granular +/- buttons (allows stepping down below 5 to 4, 3, 2, 1)
+    # Time modification handlers
     elif data.startswith("add_5_"):
-        remaining = min(180, remaining + 5)
-        total = max(total, remaining)
-        await r.set(f"remaining:{chat_id}", remaining)
-        await r.set(f"total:{chat_id}", total)
-        text = render_dashboard(subject, remaining, total, status, members)
+        remaining_sec = min(180 * 60, remaining_sec + 300)
+        if status == "idle":
+            total_sec = remaining_sec
+        else:
+            total_sec = max(total_sec, remaining_sec)
+        await r.set(f"remaining_sec:{chat_id}", remaining_sec)
+        await r.set(f"total_sec:{chat_id}", total_sec)
+        text = render_dashboard(subject, remaining_sec, total_sec, status, members)
         await query.edit_message_text(text, reply_markup=render_keyboard(chat_id, is_running=(status != "idle"), is_paused=(status == "paused")), parse_mode="Markdown")
 
     elif data.startswith("sub_5_"):
-        if remaining > 5:
-            remaining -= 5
+        if remaining_sec > 300:
+            remaining_sec -= 300
         else:
-            remaining = max(1, remaining - 1)  # Steps down by 1 if <= 5
-        await r.set(f"remaining:{chat_id}", remaining)
-        text = render_dashboard(subject, remaining, total, status, members)
+            remaining_sec = max(60, remaining_sec - 60)  # Step down by 1m if <= 5m
+        if status == "idle":
+            total_sec = remaining_sec
+        await r.set(f"remaining_sec:{chat_id}", remaining_sec)
+        await r.set(f"total_sec:{chat_id}", total_sec)
+        text = render_dashboard(subject, remaining_sec, total_sec, status, members)
         await query.edit_message_text(text, reply_markup=render_keyboard(chat_id, is_running=(status != "idle"), is_paused=(status == "paused")), parse_mode="Markdown")
 
     elif data.startswith("add_1_"):
-        remaining = min(180, remaining + 1)
-        total = max(total, remaining)
-        await r.set(f"remaining:{chat_id}", remaining)
-        await r.set(f"total:{chat_id}", total)
-        text = render_dashboard(subject, remaining, total, status, members)
+        remaining_sec = min(180 * 60, remaining_sec + 60)
+        if status == "idle":
+            total_sec = remaining_sec
+        else:
+            total_sec = max(total_sec, remaining_sec)
+        await r.set(f"remaining_sec:{chat_id}", remaining_sec)
+        await r.set(f"total_sec:{chat_id}", total_sec)
+        text = render_dashboard(subject, remaining_sec, total_sec, status, members)
         await query.edit_message_text(text, reply_markup=render_keyboard(chat_id, is_running=(status != "idle"), is_paused=(status == "paused")), parse_mode="Markdown")
 
     elif data.startswith("sub_1_"):
-        remaining = max(1, remaining - 1)  # Directly step down to 4, 3, 2, 1
-        await r.set(f"remaining:{chat_id}", remaining)
-        text = render_dashboard(subject, remaining, total, status, members)
+        remaining_sec = max(60, remaining_sec - 60)
+        if status == "idle":
+            total_sec = remaining_sec
+        await r.set(f"remaining_sec:{chat_id}", remaining_sec)
+        await r.set(f"total_sec:{chat_id}", total_sec)
+        text = render_dashboard(subject, remaining_sec, total_sec, status, members)
         await query.edit_message_text(text, reply_markup=render_keyboard(chat_id, is_running=(status != "idle"), is_paused=(status == "paused")), parse_mode="Markdown")
 
     elif data.startswith("join_"):
         await r.sadd(f"members:{chat_id}", user.first_name)
         members = list(await r.smembers(f"members:{chat_id}"))
-        text = render_dashboard(subject, remaining, total, status, members)
+        text = render_dashboard(subject, remaining_sec, total_sec, status, members)
         await query.edit_message_text(text, reply_markup=render_keyboard(chat_id, is_running=(status != "idle"), is_paused=(status == "paused")), parse_mode="Markdown")
 
 # --- App Runner ---
