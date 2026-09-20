@@ -142,18 +142,17 @@ def render_dashboard(subject: str, remaining_sec: int, total_sec: int, state: st
 
 def render_completion_alert(subject: str, total_mins: int, members: list) -> str:
     mentions = " • ".join([f"*{m}*" for m in members]) if members else "Everyone"
+    progress = make_progress_bar(0, total_mins * 60, bar_length=12)
     return (
-        f"🏆 *MISSION COMPLETE // SPRINT CONCLUDED*\n"
-        f"```text\n"
-        f"████████████████████████████████ 100%\n"
-        f"```\n"
+        f"🏆 *MISSION COMPLETE // SPRINT CONCLUDED*\n\n"
+        f"📊 *Progress:* `{progress}`\n\n"
         f"🎯 *Subject:* `{subject}`\n"
         f"⏱️ *Locked Focus:* `{total_mins} mins` logged\n"
         f"👥 *Squad:* {mentions}\n\n"
         f"🔓 *Chat permissions unlocked.*\n"
         f"☕ *Take a 5-minute breather before the next round.*"
     )
-
+    
 def render_break_over_alert(subject: str) -> str:
     return (
         f"⚡ *RECHARGE COMPLETE // READY FOR DEPLOYMENT*\n"
