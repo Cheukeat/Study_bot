@@ -4,7 +4,7 @@ import datetime
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions, BotCommand
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -69,7 +69,7 @@ def run_health_server():
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
     server.serve_forever()
 
-# --- Database Initialization ---
+# --- Database Initialization & Stats Helpers ---
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -81,6 +81,30 @@ async def init_db():
             last_study_date TEXT
         );
         """)
+        await db.commit()
+
+async def db_record_session(user_id: int, username: str, duration_mins: int):
+    today = datetime.date.today().isoformat()
+    yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT current_streak, last_study_date FROM users WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
+
+        if not row:
+            await db.execute(
+                "INSERT INTO users (user_id, username, total_minutes, current_streak, last_study_date) VALUES (?, ?, ?, ?, ?)",
+                (user_id, username, duration_mins, 1, today)
+            )
+        else:
+            streak, last_date = row
+            if last_date != today:
+                streak = streak + 1 if last_date == yesterday else 1
+
+            await db.execute(
+                "UPDATE users SET total_minutes = total_minutes + ?, current_streak = ?, last_study_date = ?, username = ? WHERE user_id = ?",
+                (duration_mins, streak, today, username, user_id)
+            )
         await db.commit()
 
 # --- Visual UI & Banner Builders ---
@@ -115,11 +139,12 @@ def render_dashboard(subject: str, remaining_sec: int, total_sec: int, state: st
     else:
         badge = "⚪ STANDBY • READY TO START"
 
-    if members:
-        squad_preview = " • ".join(members[:4])
-        if len(members) > 4:
-            squad_preview += f" +{len(members) - 4} more"
-        squad_line = f"👥 *Squad ({len(members)}):* {squad_preview}"
+    member_names = [m.split(":", 1)[1] if ":" in m else m for m in members]
+    if member_names:
+        squad_preview = " • ".join(member_names[:4])
+        if len(member_names) > 4:
+            squad_preview += f" +{len(member_names) - 4} more"
+        squad_line = f"👥 *Squad ({len(member_names)}):* {squad_preview}"
     else:
         squad_line = "👥 *Squad:* _No one has joined yet_"
 
@@ -141,7 +166,8 @@ def render_dashboard(subject: str, remaining_sec: int, total_sec: int, state: st
     )
 
 def render_completion_alert(subject: str, total_mins: int, members: list) -> str:
-    mentions = " • ".join([f"*{m}*" for m in members]) if members else "Everyone"
+    member_names = [m.split(":", 1)[1] if ":" in m else m for m in members]
+    mentions = " • ".join([f"*{m}*" for m in member_names]) if member_names else "Everyone"
     progress = make_progress_bar(0, total_mins * 60, bar_length=12)
     return (
         f"🏆 *MISSION COMPLETE // SPRINT CONCLUDED*\n\n"
@@ -151,16 +177,6 @@ def render_completion_alert(subject: str, total_mins: int, members: list) -> str
         f"👥 *Squad:* {mentions}\n\n"
         f"🔓 *Chat permissions unlocked.*\n"
         f"☕ *Take a 5-minute breather before the next round.*"
-    )
-    
-def render_break_over_alert(subject: str) -> str:
-    return (
-        f"⚡ *RECHARGE COMPLETE // READY FOR DEPLOYMENT*\n"
-        f"```text\n"
-        f"─── BREAK PROTOCOL TERMINATED ───\n"
-        f"```\n"
-        f"🧠 Time to dive back in. Last target was `{subject}`.\n"
-        f"👉 Run `/study 25` to launch another sprint!"
     )
 
 def render_cancel_alert(user_name: str, subject: str) -> str:
@@ -234,6 +250,13 @@ async def timer_tick_job(context: ContextTypes.DEFAULT_TYPE):
         await r.set(f"status:{chat_id}", "idle")
         await r.set(f"remaining_sec:{chat_id}", 0)
 
+        # Record focus minutes to SQLite for all squad members
+        total_mins = total_sec // 60
+        for m in members:
+            if ":" in m:
+                uid, uname = m.split(":", 1)
+                await db_record_session(int(uid), uname, total_mins)
+
         try:
             await context.bot.set_chat_permissions(chat_id=chat_id, permissions=OPEN_PERMISSIONS)
         except Exception:
@@ -251,12 +274,9 @@ async def timer_tick_job(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             print(f"[Warn] edit error: {e}")
 
-        total_mins = total_sec // 60
         alert_text = render_completion_alert(subject, total_mins, members)
-        
         break_keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("☕ Start 5m Break", callback_data=f"break5_{chat_id}")],
-            [InlineKeyboardButton("🚀 Next Sprint (25m)", callback_data=f"start_{chat_id}")]
+            [InlineKeyboardButton("🚀 Launch Sprint (25m)", callback_data=f"start_{chat_id}")]
         ])
         
         await context.bot.send_message(
@@ -305,9 +325,9 @@ async def study_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await r.set(f"remaining_sec:{chat_id}", total_sec)
     await r.set(f"status:{chat_id}", "idle")
     await r.delete(f"members:{chat_id}")
-    await r.sadd(f"members:{chat_id}", user.first_name)
+    await r.sadd(f"members:{chat_id}", f"{user.id}:{user.first_name}")
 
-    members = [user.first_name]
+    members = [f"{user.id}:{user.first_name}"]
     text = render_dashboard(subject, total_sec, total_sec, "idle", members)
     reply_markup = render_keyboard(chat_id, is_running=False)
     msg = await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
@@ -385,6 +405,73 @@ async def set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     new_msg = await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
     await r.set(f"msg_id:{chat_id}", new_msg.message_id)
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT username, total_minutes, current_streak, last_study_date FROM users WHERE user_id = ?", (user.id,))
+        row = await cursor.fetchone()
+
+    if not row:
+        await update.message.reply_text(f"📊 No study records yet for *{user.first_name}*! Run `/study 25` to begin.", parse_mode="Markdown")
+        return
+
+    name, minutes, streak, last_date = row
+    hours = round(minutes / 60, 1)
+
+    text = (
+        f"📊 *OPERATOR STATS // {name}*\n"
+        f"```text\n"
+        f"─────────────────────────────\n"
+        f"```\n"
+        f"⏱️ *Total Focus:* `{hours} hrs` ({minutes} mins)\n"
+        f"🔥 *Current Streak:* `{streak} days`\n"
+        f"📅 *Last Mission:* `{last_date or 'Today'}`\n"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT username, total_minutes, current_streak FROM users ORDER BY total_minutes DESC LIMIT 5")
+        rows = await cursor.fetchall()
+
+    if not rows:
+        await update.message.reply_text("🏆 Leaderboard is currently empty. Run `/study 25` to log the first session!")
+        return
+
+    text = "🏆 *STUDY ROOM CHAMPIONS*\n```text\n"
+    for rank, (name, minutes, streak) in enumerate(rows, 1):
+        hours = round(minutes / 60, 1)
+        text += f"{rank}. {name:<12} {hours:>4}h | 🔥 {streak}d\n"
+    text += "```"
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_text = (
+        f"⚡ *STUDY ROOM ASSISTANT // SYSTEM GUIDE* ⚡\n"
+        f"```text\n"
+        f"──────────────── COMMANDS ────────────────\n"
+        f"```\n"
+        f"🚀 `/study [subject] [min]`\n"
+        f"└ Launch focus dashboard (e.g. `/study Physics 45`).\n\n"
+        f"⚙️ `/set [subject] [min]`\n"
+        f"└ Adjust live time/subject (e.g. `/set 20` or `/set Math 30`).\n\n"
+        f"🛑 `/cancel`\n"
+        f"└ Abort active sprint & unlock chat (Admin only).\n\n"
+        f"📊 `/stats`\n"
+        f"└ View personal focus hours and daily streak.\n\n"
+        f"🏆 `/leaderboard`\n"
+        f"└ View group rankings & top study streaks.\n\n"
+        f"```text\n"
+        f"────────────── DASHBOARD CONTROLS ──────────────\n"
+        f"```\n"
+        f"• *Launch Sprint:* Locks group media & begins countdown.\n"
+        f"• *Pause / Resume:* Temporarily opens chat without losing progress.\n"
+        f"• *+/- Buttons:* Adjust timer by 5m or 1m increments.\n"
+        f"• *Join Squad:* Add your name to the active focus roster.\n\n"
+        f"💡 _Tip: Make sure the bot is an Admin with 'Restrict Members' permission._"
+    )
+    await update.message.reply_text(help_text, parse_mode="Markdown")
 
 async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -500,7 +587,8 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         toast_msg = f"⏱️ -1m ({remaining_sec // 60}m)"
 
     elif data.startswith("join_"):
-        await r.sadd(f"members:{chat_id}", user.first_name)
+        user_tag = f"{user.id}:{user.first_name}"
+        await r.sadd(f"members:{chat_id}", user_tag)
         members = list(await r.smembers(f"members:{chat_id}"))
         toast_msg = f"✋ {user.first_name} joined!"
 
@@ -519,6 +607,18 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         print(f"[Error editing message]: {e}")
 
+# --- Native Telegram Menu Setup ---
+async def post_init(application):
+    commands = [
+        BotCommand("study", "Launch focus dashboard"),
+        BotCommand("set", "Adjust duration/subject (/set 25)"),
+        BotCommand("cancel", "Abort sprint (Admin only)"),
+        BotCommand("stats", "View personal study hours & streak"),
+        BotCommand("leaderboard", "View top rankings"),
+        BotCommand("help", "Show user guide"),
+    ]
+    await application.bot.set_my_commands(commands)
+
 # --- App Runner ---
 def main():
     asyncio.run(init_db())
@@ -526,11 +626,14 @@ def main():
     server_thread = threading.Thread(target=run_health_server, daemon=True)
     server_thread.start()
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("study", study_command))
     app.add_handler(CommandHandler("cancel", cancel_study))
     app.add_handler(CommandHandler("set", set_command))
+    app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("leaderboard", leaderboard_command))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CallbackQueryHandler(button_router))
 
     print("Study Room Bot is running... Press Ctrl+C to stop.")
