@@ -48,13 +48,18 @@ OPEN_PERMISSIONS = ChatPermissions(
     can_add_web_page_previews=True,
 )
 
-# --- Minimal HTTP Server for Render Health Checks ---
+# --- HTTP Server for Render Health Checks & UptimeRobot ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
         self.wfile.write(b"Study Room Bot is alive!")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
 
     def log_message(self, format, *args):
         return
@@ -188,7 +193,6 @@ async def timer_tick_job(context: ContextTypes.DEFAULT_TYPE):
     subject = await r.get(f"subject:{chat_id}") or "General Focus"
     members = list(await r.smembers(f"members:{chat_id}"))
 
-    # Decrement by 60s
     remaining_sec -= 60
 
     if remaining_sec <= 0:
@@ -210,8 +214,8 @@ async def timer_tick_job(context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=render_keyboard(chat_id, is_running=False),
                 parse_mode="Markdown"
             )
-        except Exception as e:
-            print(f"[Warn] edit error: {e}")
+        except Exception:
+            pass
 
         await context.bot.send_message(
             chat_id=chat_id,
@@ -231,8 +235,8 @@ async def timer_tick_job(context: ContextTypes.DEFAULT_TYPE):
             reply_markup=render_keyboard(chat_id, is_running=True, is_paused=False),
             parse_mode="Markdown"
         )
-    except Exception as e:
-        print(f"[Warn] tick edit error: {e}")
+    except Exception:
+        pass
 
 # --- Command Handlers ---
 
@@ -388,7 +392,6 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await r.set(f"subject:{chat_id}", new_sub)
         toast_msg = f"Subject: {new_sub}"
 
-    # --- Robust Time Adjustments ---
     elif data.startswith("add5_"):
         remaining_sec = min(180 * 60, remaining_sec + 300)
         if status == "idle":
@@ -403,7 +406,6 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if remaining_sec > 300:
             remaining_sec -= 300
         else:
-            # If 5m or less, step down by 1m (minimum 1m = 60s)
             remaining_sec = max(60, remaining_sec - 60)
         
         if status == "idle":
@@ -435,13 +437,11 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         members = list(await r.smembers(f"members:{chat_id}"))
         toast_msg = f"✋ {user.first_name} joined!"
 
-    # Answer query with toast notification
     if toast_msg:
         await query.answer(toast_msg)
     else:
         await query.answer()
 
-    # Re-render card
     is_running = (status == "running")
     is_paused = (status == "paused")
     text = render_dashboard(subject, remaining_sec, total_sec, status, members)
