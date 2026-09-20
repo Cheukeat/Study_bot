@@ -48,7 +48,7 @@ OPEN_PERMISSIONS = ChatPermissions(
     can_add_web_page_previews=True,
 )
 
-# --- HTTP Server for Render Health Checks & UptimeRobot ---
+# --- Minimal HTTP Server for Render Health Checks & UptimeRobot ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -83,7 +83,7 @@ async def init_db():
         """)
         await db.commit()
 
-# --- Visual Component Builders ---
+# --- Visual UI & Banner Builders ---
 
 def make_progress_bar(remaining_sec: int, total_sec: int, bar_length: int = 10) -> str:
     if total_sec <= 0:
@@ -138,6 +138,41 @@ def render_dashboard(subject: str, remaining_sec: int, total_sec: int, state: st
         f"{squad_line}\n"
         f"───────────────────────────\n"
         f"💡 _Tip: Use /set 15 or click buttons to adjust!_\n"
+    )
+
+def render_completion_alert(subject: str, total_mins: int, members: list) -> str:
+    mentions = " • ".join([f"*{m}*" for m in members]) if members else "Everyone"
+    return (
+        f"🏆 *MISSION COMPLETE // SPRINT CONCLUDED*\n"
+        f"```text\n"
+        f"████████████████████████████████ 100%\n"
+        f"```\n"
+        f"🎯 *Subject:* `{subject}`\n"
+        f"⏱️ *Locked Focus:* `{total_mins} mins` logged\n"
+        f"👥 *Squad:* {mentions}\n\n"
+        f"🔓 *Chat permissions unlocked.*\n"
+        f"☕ *Take a 5-minute breather before the next round.*"
+    )
+
+def render_break_over_alert(subject: str) -> str:
+    return (
+        f"⚡ *RECHARGE COMPLETE // READY FOR DEPLOYMENT*\n"
+        f"```text\n"
+        f"─── BREAK PROTOCOL TERMINATED ───\n"
+        f"```\n"
+        f"🧠 Time to dive back in. Last target was `{subject}`.\n"
+        f"👉 Run `/study 25` to launch another sprint!"
+    )
+
+def render_cancel_alert(user_name: str, subject: str) -> str:
+    return (
+        f"🛑 *SESSION OVERRIDE // ABORTED*\n"
+        f"```text\n"
+        f"─── TIMER TERMINATED BY ADMIN ───\n"
+        f"```\n"
+        f"👤 *Operator:* {user_name}\n"
+        f"🎯 *Target Cancelled:* `{subject}`\n"
+        f"🔓 *Chat restrictions have been reset to normal.*"
     )
 
 def render_keyboard(chat_id: int, is_running: bool = False, is_paused: bool = False):
@@ -214,12 +249,21 @@ async def timer_tick_job(context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=render_keyboard(chat_id, is_running=False),
                 parse_mode="Markdown"
             )
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Warn] edit error: {e}")
 
+        total_mins = total_sec // 60
+        alert_text = render_completion_alert(subject, total_mins, members)
+        
+        break_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("☕ Start 5m Break", callback_data=f"break5_{chat_id}")],
+            [InlineKeyboardButton("🚀 Next Sprint (25m)", callback_data=f"start_{chat_id}")]
+        ])
+        
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"🔔 *Focus Complete!* Great session on *{subject}*.\n☕ Take a 5-minute break!",
+            text=alert_text,
+            reply_markup=break_keyboard,
             parse_mode="Markdown"
         )
         return
@@ -235,8 +279,8 @@ async def timer_tick_job(context: ContextTypes.DEFAULT_TYPE):
             reply_markup=render_keyboard(chat_id, is_running=True, is_paused=False),
             parse_mode="Markdown"
         )
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[Warn] tick edit error: {e}")
 
 # --- Command Handlers ---
 
@@ -270,6 +314,30 @@ async def study_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
 
     await r.set(f"msg_id:{chat_id}", msg.message_id)
+
+async def cancel_study(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+
+    if update.effective_chat.type in ["group", "supergroup"]:
+        member = await context.bot.get_chat_member(chat_id, user.id)
+        if member.status not in ["creator", "administrator"]:
+            await update.message.reply_text("⚠️ Only group administrators can abort an active sprint.")
+            return
+
+    for job in context.job_queue.get_jobs_by_name(f"tick_{chat_id}"):
+        job.schedule_removal()
+
+    subject = await r.get(f"subject:{chat_id}") or "General Focus"
+    await r.set(f"status:{chat_id}", "idle")
+
+    try:
+        await context.bot.set_chat_permissions(chat_id=chat_id, permissions=OPEN_PERMISSIONS)
+    except Exception:
+        pass
+
+    cancel_text = render_cancel_alert(user.first_name, subject)
+    await update.message.reply_text(cancel_text, parse_mode="Markdown")
 
 async def set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -352,7 +420,7 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             name=f"tick_{chat_id}"
         )
         status = "running"
-        toast_msg = "🚀 Sprint started!"
+        toast_msg = "🚀 Sprint launched!"
 
     elif data.startswith("pause_"):
         await r.set(f"status:{chat_id}", "paused")
@@ -390,7 +458,7 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         new_sub = data.split("_")[1]
         subject = new_sub
         await r.set(f"subject:{chat_id}", new_sub)
-        toast_msg = f"Subject: {new_sub}"
+        toast_msg = f"Target: {new_sub}"
 
     elif data.startswith("add5_"):
         remaining_sec = min(180 * 60, remaining_sec + 300)
@@ -462,6 +530,7 @@ def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("study", study_command))
+    app.add_handler(CommandHandler("cancel", cancel_study))
     app.add_handler(CommandHandler("set", set_command))
     app.add_handler(CallbackQueryHandler(button_router))
 
